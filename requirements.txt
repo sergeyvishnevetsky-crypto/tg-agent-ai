@@ -16,6 +16,7 @@ jiter==0.12.0
 MarkupSafe==3.0.3
 openai==2.8.1
 packaging==25.0
+psycopg2-binary==2.9.11
 pyaes==1.6.1
 pyasn1==0.6.1
 pydantic==2.12.5
