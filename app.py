@@ -36,6 +36,9 @@ SYSTEM_PROMPT = os.getenv(
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# список chat_id, которые ОН НЕ ДОЛЖЕН ОТВЕЧАТЬ (через запятую)
+IGNORE_CHAT_IDS_RAW = os.getenv("IGNORE_CHAT_IDS", "")
+
 REQUIRED_OK = all([TG_API_ID, TG_API_HASH, TG_SESSION, OPENAI_API_KEY])
 
 # --- OpenAI ---
@@ -342,6 +345,10 @@ def parse_target_ids(raw: str):
     return ids
 
 
+# список игнорируемых чатов (по chat_id)
+IGNORE_CHAT_IDS = set(parse_target_ids(IGNORE_CHAT_IDS_RAW))
+
+
 if client is not None:
     @client.on(events.NewMessage(incoming=True))
     async def on_new_message(event):
@@ -352,6 +359,17 @@ if client is not None:
             return
 
         chat_id = event.chat_id
+
+        # 1) Полностью игнорируем группы и каналы
+        if getattr(event, "is_group", False) or getattr(event, "is_channel", False):
+            logger.info("Игнорируем сообщение из группы/канала %s", chat_id)
+            return
+
+        # 2) Игнорируем конкретные чаты из списка IGNORE_CHAT_IDS
+        if chat_id in IGNORE_CHAT_IDS:
+            logger.info("Игнорируем сообщение из chat_id %s (IGNORE_CHAT_IDS)", chat_id)
+            return
+
         text = event.raw_text
 
         logger.info("Сообщение от %s: %s", chat_id, text)
@@ -366,8 +384,7 @@ if client is not None:
 
 async def send_initial_messages():
     """
-    Раньше тут была автозапуск рассылки при старте воркера.
-    Сейчас отключено — рассылка запускается вручную через /broadcast.
+    Авторассылка при старте воркера отключена — используется страница /broadcast.
     """
     logger.info("Авторассылка при старте воркера отключена. Используй веб-кнопку /broadcast.")
     return
@@ -518,6 +535,7 @@ INDEX_HTML = """
       <li>TARGET_IDS (env): {{ target_ids_raw or 'пусто' }}</li>
       <li>START_MESSAGE (env): {{ 'задано' if start_message else 'пусто' }}</li>
       <li>SYSTEM_PROMPT (env): {{ 'задан' if system_prompt else 'по умолчанию' }}</li>
+      <li>IGNORE_CHAT_IDS (env): {{ ignore_chat_ids_raw or 'пусто' }}</li>
     </ul>
 
     <p style="font-size:13px;color:#9ca3af;">
@@ -770,6 +788,7 @@ def index():
         target_ids_raw=TARGET_IDS_RAW,
         start_message=START_MESSAGE,
         system_prompt=SYSTEM_PROMPT,
+        ignore_chat_ids_raw=IGNORE_CHAT_IDS_RAW,
     )
 
 
