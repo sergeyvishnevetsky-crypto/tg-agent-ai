@@ -25,6 +25,7 @@ TG_SESSION = os.getenv("TG_SESSION")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
+# env по умолчанию (на случай, если БД нет)
 TARGET_IDS_RAW = os.getenv("TARGET_IDS", "")
 START_MESSAGE = os.getenv("START_MESSAGE", "")
 
@@ -53,7 +54,7 @@ if TG_API_ID and TG_API_HASH and TG_SESSION:
 dialogues = {}
 
 
-# --- Работа с базой (тезисы и настройки рассылки) ---
+# --- Работа с базой (тезисы, настройки рассылки, история рассылок) ---
 
 def get_db_conn():
     if not DATABASE_URL:
@@ -63,12 +64,14 @@ def get_db_conn():
 
 def init_db():
     """
-    Создаём таблицы ai_prompt и agent_settings, если их ещё нет,
-    и стартовые записи.
+    Создаём таблицы:
+      - ai_prompt      (тезисы для ИИ)
+      - agent_settings (настройки рассылки)
+      - broadcast_log  (история рассылок)
     """
     conn = get_db_conn()
     if conn is None:
-        logger.warning("DATABASE_URL не задан, веб-редактор тезисов/настроек работать не будет.")
+        logger.warning("DATABASE_URL не задан, БД-функции (тезисы/рассылка/лог) работать не будут.")
         return
 
     try:
@@ -92,6 +95,21 @@ def init_db():
                         target_ids TEXT,
                         start_message TEXT,
                         updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    """
+                )
+                # История рассылок
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS broadcast_log (
+                        id SERIAL PRIMARY KEY,
+                        chat_id BIGINT,
+                        chat_type TEXT,
+                        chat_name TEXT,
+                        message TEXT,
+                        success BOOLEAN,
+                        error TEXT,
+                        sent_at TIMESTAMPTZ DEFAULT NOW()
                     );
                     """
                 )
@@ -120,9 +138,6 @@ def init_db():
 
 
 def get_prompt_from_db():
-    """
-    Берём текущие тезисы из БД (если есть).
-    """
     conn = get_db_conn()
     if conn is None:
         return None
@@ -140,9 +155,6 @@ def get_prompt_from_db():
 
 
 def set_prompt_in_db(text: str):
-    """
-    Обновляем/создаём единственную запись с тезисами.
-    """
     conn = get_db_conn()
     if conn is None:
         raise RuntimeError("DATABASE_URL не задан, некуда сохранить тезисы.")
@@ -191,9 +203,6 @@ def get_agent_settings():
 
 
 def set_agent_settings(target_ids: str, start_message: str):
-    """
-    Обновляем/создаём единственную запись с TARGET_IDS и START_MESSAGE.
-    """
     conn = get_db_conn()
     if conn is None:
         raise RuntimeError("DATABASE_URL не задан, некуда сохранить настройки рассылки.")
@@ -223,7 +232,70 @@ def set_agent_settings(target_ids: str, start_message: str):
         conn.close()
 
 
-# Инициализация таблиц
+def log_broadcast(chat_id, chat_type, chat_name, message, success, error_text=None):
+    """
+    Пишем одну запись в историю рассылки.
+    """
+    conn = get_db_conn()
+    if conn is None:
+        logger.warning("DATABASE_URL не задан — лог рассылки не сохраняется.")
+        return
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO broadcast_log
+                        (chat_id, chat_type, chat_name, message, success, error)
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                    """,
+                    (chat_id, chat_type, chat_name, message, success, error_text),
+                )
+    finally:
+        conn.close()
+
+
+def get_broadcast_log(limit: int = 50):
+    """
+    Возвращаем последние записи истории рассылок.
+    """
+    conn = get_db_conn()
+    if conn is None:
+        return []
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT chat_id, chat_type, chat_name, message, success, error, sent_at
+                      FROM broadcast_log
+                  ORDER BY sent_at DESC
+                     LIMIT %s;
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                result = []
+                for r in rows:
+                    result.append(
+                        {
+                            "chat_id": r[0],
+                            "chat_type": r[1],
+                            "chat_name": r[2],
+                            "message": r[3],
+                            "success": r[4],
+                            "error": r[5],
+                            "sent_at": r[6],
+                        }
+                    )
+                return result
+    finally:
+        conn.close()
+
+
+# Инициализация таблиц при старте
 init_db()
 
 
@@ -294,26 +366,11 @@ if client is not None:
 
 async def send_initial_messages():
     """
-    При старте воркера — разослать стартовое сообщение, если задано.
-    Настройки берём из БД (agent_settings).
+    Раньше тут была автозапуск рассылки при старте воркера.
+    Сейчас отключено — рассылка запускается вручную через /broadcast.
     """
-    if client is None:
-        return
-
-    target_ids_str, start_msg = get_agent_settings()
-    ids = parse_target_ids(target_ids_str)
-
-    if not start_msg or not ids:
-        logger.info("START_MESSAGE или TARGET_IDS не заданы — стартовая рассылка пропущена.")
-        return
-
-    logger.info("Шлю стартовое сообщение %d адресатам", len(ids))
-    for uid in ids:
-        try:
-            await client.send_message(uid, start_msg)
-            logger.info("Стартовое сообщение отправлено: %s", uid)
-        except Exception as e:
-            logger.exception("Не удалось отправить %s: %s", uid, e)
+    logger.info("Авторассылка при старте воркера отключена. Используй веб-кнопку /broadcast.")
+    return
 
 
 async def main():
@@ -332,6 +389,94 @@ async def main():
     await client.run_until_disconnected()
 
 
+# --- Вспомогательное: чтение диалогов и рассылка синхронно через Telethon ---
+
+def fetch_dialogs(limit: int = 50):
+    """
+    Получаем список диалогов (название + id) через синхронный клиент Telethon.
+    """
+    if not (TG_API_ID and TG_API_HASH and TG_SESSION):
+        return []
+
+    dialogs_data = []
+    try:
+        with SyncTelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH) as sync_client:
+            for d in sync_client.iter_dialogs(limit=limit):
+                if d.is_user:
+                    d_type = "user"
+                elif d.is_group:
+                    d_type = "group"
+                elif d.is_channel:
+                    d_type = "channel"
+                else:
+                    d_type = "other"
+
+                name = d.name or "(без названия)"
+                dialogs_data.append({
+                    "id": d.id,
+                    "name": name,
+                    "type": d_type,
+                })
+    except Exception as e:
+        logger.exception("Ошибка при получении диалогов: %s", e)
+    return dialogs_data
+
+
+def run_broadcast_now():
+    """
+    Запускаем рассылку из веб-интерфейса:
+      - читаем настройки из БД;
+      - шлём сообщения через SyncTelegramClient;
+      - пишем историю в broadcast_log;
+      - возвращаем (total, ok, fail).
+    """
+    if not (TG_API_ID and TG_API_HASH and TG_SESSION):
+        raise RuntimeError("Нет Telegram-кредов, рассылка невозможна.")
+
+    target_ids_str, start_msg = get_agent_settings()
+    ids = parse_target_ids(target_ids_str)
+
+    if not start_msg:
+        raise RuntimeError("START_MESSAGE пустой — нечего рассылать.")
+    if not ids:
+        raise RuntimeError("TARGET_IDS пустой — не указано, кому слать.")
+
+    total = len(ids)
+    ok = 0
+    fail = 0
+
+    with SyncTelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH) as sync_client:
+        for chat_id in ids:
+            chat_name = ""
+            chat_type = ""
+            try:
+                entity = sync_client.get_entity(chat_id)
+                # определяем тип и имя
+                try:
+                    chat_name = getattr(entity, "title", None) or getattr(entity, "first_name", "") or "(без названия)"
+                except Exception:
+                    chat_name = "(без названия)"
+
+                if getattr(entity, "megagroup", False) or getattr(entity, "gigagroup", False):
+                    chat_type = "group"
+                elif getattr(entity, "broadcast", False):
+                    chat_type = "channel"
+                else:
+                    chat_type = "user"
+
+                sync_client.send_message(chat_id, start_msg)
+                ok += 1
+                log_broadcast(chat_id, chat_type, chat_name, start_msg, True, None)
+                logger.info("Рассылка: успешно отправлено в %s (%s)", chat_id, chat_name)
+            except Exception as e:
+                fail += 1
+                err_text = str(e)
+                log_broadcast(chat_id, chat_type or "unknown", chat_name or "", start_msg, False, err_text)
+                logger.exception("Рассылка: ошибка отправки в %s: %s", chat_id, e)
+
+    return total, ok, fail
+
+
 # --- Flask веб-интерфейс ---
 
 app = Flask(__name__)
@@ -346,7 +491,7 @@ INDEX_HTML = """
   <title>Telegram AI Agent — статус</title>
 </head>
 <body style="font-family: system-ui, -apple-system; background:#111827; color:#e5e7eb;">
-  <div style="max-width:820px;margin:40px auto;padding:24px;border-radius:16px;background:#020617;border:1px solid #1f2937;">
+  <div style="max-width:860px;margin:40px auto;padding:24px;border-radius:16px;background:#020617;border:1px solid #1f2937;">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
       <div>
         <h1 style="margin:0 0 4px 0;font-size:24px;">Telegram AI Agent</h1>
@@ -356,6 +501,7 @@ INDEX_HTML = """
         <a href="{{ url_for('edit_prompt') }}" style="padding:6px 12px;border-radius:999px;border:1px solid #374151;color:#e5e7eb;text-decoration:none;font-size:13px;">✏️ Тезисы для ИИ</a>
         <a href="{{ url_for('settings_page') }}" style="padding:6px 12px;border-radius:999px;border:1px solid #374151;color:#e5e7eb;text-decoration:none;font-size:13px;">🎯 Цели рассылки</a>
         <a href="{{ url_for('dialogs_page') }}" style="padding:6px 12px;border-radius:999px;border:1px solid #374151;color:#e5e7eb;text-decoration:none;font-size:13px;">📚 Диалоги Telegram</a>
+        <a href="{{ url_for('broadcast_page') }}" style="padding:6px 12px;border-radius:999px;border:1px solid #22c55e;color:#bbf7d0;text-decoration:none;font-size:13px;">▶️ Рассылка</a>
       </div>
     </div>
 
@@ -376,7 +522,7 @@ INDEX_HTML = """
 
     <p style="font-size:13px;color:#9ca3af;">
       Реальные значения для стартовой рассылки и тезисов берутся из базы (страницы «Тезисы для ИИ» и «Цели рассылки»).<br>
-      Worker запускается командой <code>heroku ps:scale worker=1</code> после настройки всех переменных и тезисов.
+      Worker обрабатывает входящие сообщения, а рассылка стартует вручную на странице «Рассылка».
     </p>
   </div>
 </body>
@@ -436,7 +582,7 @@ SETTINGS_HTML = """
   <div style="max-width:840px;margin:40px auto;padding:24px;border-radius:16px;background:#020617;border:1px solid #1f2937;">
     <h1 style="margin-top:0;font-size:22px;">Цели рассылки и первое сообщение</h1>
     <p style="color:#9ca3af;font-size:14px;">
-      Здесь ты задаёшь, <b>кому агент пишет первым</b> и какой текст отправляет при старте воркера.<br>
+      Здесь ты задаёшь, <b>кому агент пишет первым</b> и какой текст отправляет при запуске рассылки.<br>
       Формат списка ID: <code>123456789,-1002222333444</code> (через запятую).
     </p>
 
@@ -520,8 +666,88 @@ DIALOGS_HTML = """
     {% endif %}
 
     <p style="margin-top:18px;font-size:13px;color:#9ca3af;">
-      После обновления целей рассылки на странице «Цели рассылки» перезапусти воркер:
-      <code>heroku ps:restart worker</code>.
+      После обновления целей рассылки используй страницу «Рассылка», чтобы отправить сообщения.
+    </p>
+
+    <p style="font-size:13px;">
+      <a href="{{ url_for('index') }}" style="color:#9ca3af;text-decoration:none;">← Назад к статусу</a>
+    </p>
+  </div>
+</body>
+</html>
+"""
+
+
+BROADCAST_HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Рассылка — Telegram Agent</title>
+</head>
+<body style="font-family: system-ui, -apple-system; background:#020617; color:#e5e7eb;">
+  <div style="max-width:900px;margin:40px auto;padding:24px;border-radius:16px;background:#020617;border:1px solid #1f2937;">
+    <h1 style="margin-top:0;font-size:22px;">Рассылка</h1>
+    <p style="color:#9ca3af;font-size:14px;">
+      Эта страница запускает рассылку по текущим настройкам (страница «Цели рассылки»).
+    </p>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div style="margin:8px 0 12px 0;color:#bbf7d0;font-size:13px;">
+          {% for m in messages %}
+            {{ m }}
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <form method="post">
+      <p style="font-size:13px;color:#fbbf24;">
+        Перед запуском убедись, что правильно заполнены <a href="{{ url_for('settings_page') }}" style="color:#93c5fd;">цели рассылки</a>.
+      </p>
+      <button type="submit" style="border:none;border-radius:999px;padding:10px 22px;background:#22c55e;color:#022c22;font-size:15px;cursor:pointer;">
+        ▶️ Запустить рассылку сейчас
+      </button>
+    </form>
+
+    <h2 style="margin-top:24px;font-size:18px;">История рассылок (последние {{ logs|length }})</h2>
+
+    {% if not logs %}
+      <p style="color:#9ca3af;font-size:14px;">Пока нет записей. Запусти первую рассылку.</p>
+    {% else %}
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:12px;">
+        <thead>
+          <tr>
+            <th style="text-align:left;border-bottom:1px solid #1f2937;padding:6px;">Время</th>
+            <th style="text-align:left;border-bottom:1px solid #1f2937;padding:6px;">Тип</th>
+            <th style="text-align:left;border-bottom:1px solid #1f2937;padding:6px;">Чат</th>
+            <th style="text-align:left;border-bottom:1px solid #1f2937;padding:6px;">chat_id</th>
+            <th style="text-align:left;border-bottom:1px solid #1f2937;padding:6px;">Статус</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in logs %}
+            <tr>
+              <td style="padding:6px;border-bottom:1px solid #111827;">{{ r.sent_at }}</td>
+              <td style="padding:6px;border-bottom:1px solid #111827;">{{ r.chat_type }}</td>
+              <td style="padding:6px;border-bottom:1px solid #111827;">{{ r.chat_name }}</td>
+              <td style="padding:6px;border-bottom:1px solid #111827;"><code>{{ r.chat_id }}</code></td>
+              <td style="padding:6px;border-bottom:1px solid #111827;">
+                {% if r.success %}
+                  <span style="color:#4ade80;">успех</span>
+                {% else %}
+                  <span style="color:#fecaca;" title="{{ r.error or '' }}">ошибка</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+
+    <p style="margin-top:18px;font-size:13px;color:#9ca3af;">
+      Если какие-то отправки не прошли (ошибка), наведи курсор на «ошибка» чтобы увидеть текст.
     </p>
 
     <p style="font-size:13px;">
@@ -584,37 +810,6 @@ def settings_page():
     )
 
 
-def fetch_dialogs(limit: int = 50):
-    """
-    Получаем список диалогов (название + id) через синхронный клиент Telethon.
-    """
-    if not (TG_API_ID and TG_API_HASH and TG_SESSION):
-        return []
-
-    dialogs_data = []
-    try:
-        with SyncTelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH) as sync_client:
-            for d in sync_client.iter_dialogs(limit=limit):
-                if d.is_user:
-                    d_type = "user"
-                elif d.is_group:
-                    d_type = "group"
-                elif d.is_channel:
-                    d_type = "channel"
-                else:
-                    d_type = "other"
-
-                name = d.name or "(без названия)"
-                dialogs_data.append({
-                    "id": d.id,
-                    "name": name,
-                    "type": d_type,
-                })
-    except Exception as e:
-        logger.exception("Ошибка при получении диалогов: %s", e)
-    return dialogs_data
-
-
 @app.route("/dialogs")
 def dialogs_page():
     has_creds = bool(TG_API_ID and TG_API_HASH and TG_SESSION)
@@ -624,6 +819,21 @@ def dialogs_page():
         dialogs=dialogs,
         has_creds=has_creds,
     )
+
+
+@app.route("/broadcast", methods=["GET", "POST"])
+def broadcast_page():
+    if request.method == "POST":
+        try:
+            total, ok, fail = run_broadcast_now()
+            flash(f"Рассылка запущена. Всего: {total}, успешно: {ok}, ошибок: {fail}.")
+        except Exception as e:
+            logger.exception("Ошибка при запуске рассылки: %s", e)
+            flash(f"Ошибка при запуске рассылки: {e}")
+        return redirect(url_for("broadcast_page"))
+
+    logs = get_broadcast_log(limit=50)
+    return render_template_string(BROADCAST_HTML, logs=logs)
 
 
 if __name__ == "__main__":
