@@ -36,7 +36,7 @@ SYSTEM_PROMPT = os.getenv(
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# список chat_id, которые ОН НЕ ДОЛЖЕН ОТВЕЧАТЬ (через запятую)
+# список chat_id, которым ОН НЕ ДОЛЖЕН ОТВЕЧАТЬ (через запятую)
 IGNORE_CHAT_IDS_RAW = os.getenv("IGNORE_CHAT_IDS", "")
 
 REQUIRED_OK = all([TG_API_ID, TG_API_HASH, TG_SESSION, OPENAI_API_KEY])
@@ -349,23 +349,26 @@ def parse_target_ids(raw: str):
 IGNORE_CHAT_IDS = set(parse_target_ids(IGNORE_CHAT_IDS_RAW))
 
 
+# --- обработчик сообщений Telegram ---
+
 if client is not None:
     @client.on(events.NewMessage(incoming=True))
     async def on_new_message(event):
         """
         Обработчик входящих сообщений.
         """
+        # не трогаем свои исходящие сообщения
         if event.out:
             return
 
         chat_id = event.chat_id
 
-        # 1) Полностью игнорируем группы и каналы
-        if getattr(event, "is_group", False) or getattr(event, "is_channel", False):
-            logger.info("Игнорируем сообщение из группы/канала %s", chat_id)
+        # 1) работаем ТОЛЬКО с личными чатами
+        if not event.is_private:
+            logger.info("Игнорируем не-личный чат %s (group/channel)", chat_id)
             return
 
-        # 2) Игнорируем конкретные чаты из списка IGNORE_CHAT_IDS
+        # 2) игнорируем конкретные чаты из IGNORE_CHAT_IDS
         if chat_id in IGNORE_CHAT_IDS:
             logger.info("Игнорируем сообщение из chat_id %s (IGNORE_CHAT_IDS)", chat_id)
             return
@@ -540,7 +543,7 @@ INDEX_HTML = """
 
     <p style="font-size:13px;color:#9ca3af;">
       Реальные значения для стартовой рассылки и тезисов берутся из базы (страницы «Тезисы для ИИ» и «Цели рассылки»).<br>
-      Worker обрабатывает входящие сообщения, а рассылка стартует вручную на странице «Рассылка».
+      Worker обрабатывает <b>только личные чаты</b>; группы и каналы он игнорирует. Рассылка стартует вручную на странице «Рассылка».
     </p>
   </div>
 </body>
